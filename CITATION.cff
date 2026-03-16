@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this toolkit in your research, please cite it as below."
+title: "SAD-Pipe"
+version: "1.0.0"
+date-released: 2026-03-11
+authors:
+  - family-names: "Maerz"
+    given-names: "Maren"
+  - family-names: "Sieg"
+    given-names: "Miriam"
+repository-code: "https://github.com/maerz-m/SAD_Pipe"
+license: "MIT"
+type: software
+abstract: >
+  A modular framework for simulating, analyzing, and visualizing synthetic exam
+  data using Classical Test Theory (CTT) and Item Response Theory (IRT). Includes
+  configurable simulation pipelines, item-level diagnostics, and
+  publication-quality visualizations.

@@ -1,0 +1,907 @@
+---
+title: Synthetic Assessment Data Pipeline (SAD-Pipe) - Simulation
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 120
+---
+
+This notebook generates a synthetic multiple-choice exam dataset with realistic psychometric structure.
+
+## Purpose
+
+The goal is to produce *reproducible* synthetic response data for prototyping and testing downstream analysis workflows
+(e.g., scoring, item analysis, distractor behavior).
+
+The simulation combines:
+
+-   2PL-like knowledge model (item difficulty `b`, discrimination `a`)
+-   person-level traits (`theta_true`, `carelessness`, `guessiness`, `testwiseness`)
+-   item types (regular / regular_clean / diluted / misleading)
+-   distractor attractiveness profiles
+
+## Reproducibility
+
+-   Randomness is controlled via `seed` .
+-   With the same `seed` and the same `simulation_config`, the script is intended to generate identical outputs.
+
+## Configuration
+
+The main entry point is:
+
+-   `results = run_simulation(config)`
+
+Key parameters:
+
+-   `seed`: controls randomness
+-   `n_items`: number of items
+-   `n_students`: number of test-takers
+-   `options`: answer options (default: `A`–`E`)
+-   `item_type_dist`: item type proportions
+
+### Item type proportions
+
+Set proportions via `item_type_dist` in `simulation_config`. You can omit `regular`; it will be set to the remainder.
+
+``` r
+config = simulation_config(
+    seed=42,
+    n_items=80,
+    n_students=200,
+    item_type_dist={
+        "regular_clean": 0.20, # 20% of the items
+        "diluted": 0.10, # 10 % of the items
+        "misleading": 0.10, # 10 % of the items
+        # "regular" becomes 0.600 automatically
+    },
+)
+results = run_simulation(config)
+```
+
+## Outputs (data dictionary)
+
+The simulation returns a dictionary `results` with four data frames (tibbles).
+
+### `results$answer_matrix`
+
+-   **Shape**: `(n_students, n_items)`
+-   **Rows**: one row per person
+-   **Columns**: `item1 ... itemN`
+-   **Values**: selected option label (e.g., `"A"`, `"B"`, ...)
+
+### `results$scored_responses`
+
+-   **Item columns**: `0/1` correctness per item
+-   **`score`**: sum over item columns
+-   **`score_pct`**: `score / n_items * 100`
+
+### `results$item_metadata`
+
+One row per item.
+
+-   **`item`**: item identifier (e.g., `item17`)
+-   **`item_type`**: one of `regular`, `regular_clean`, `diluted`, `misleading`
+-   **`num_options`**: number of answer options (including the correct answer)
+-   **`correct_answer`**: correct option label
+-   **`a_param`**: discrimination
+-   **`b_param`**: difficulty
+-   **`slip`**: slip probability (know → incorrect)
+-   **`distractors`**: list of incorrect option labels
+-   **`distractor_weights`**: mapping distractor → sampling weight
+
+### `results$testtakers`
+
+One row per person.
+
+-   **`theta_true`**: latent ability
+-   **`carelessness`**, **`guessiness`**, **`testwiseness`**: behavioral traits
+-   **`score`**, **`score_pct`**: total performance summary
+
+## Code and Preparation
+
+```{r library}
+#| include: false
+#| warning: false
+
+library(tidyverse)
+library(fs)
+library(rlang)
+library(patchwork)
+library(ggplot2)
+```
+
+```{r plotthemes}
+#| include: false
+
+# Seaborn Theme in ggplot2 (whitegrid, pastel)
+theme_set(
+  theme_minimal() + 
+  theme(
+    panel.grid.major = element_line(color = "#e0e0e0"),
+    panel.grid.minor = element_blank()
+  )
+)
+
+# Farbpalette 
+item_type_colors <- c(
+  "regular"       = "#3B5070",
+  "regular_clean" = "#765B7A",
+  "diluted"       = "#B56576",
+  "misleading"    = "#eaac8b"
+)
+```
+
+### Simulation Configuration Function
+
+```{r simulation_config_function}
+
+simulation_config <- function(
+    seed = 63111426,
+    n_items = 80,
+    n_students = 200,
+    options = c("A", "B", "C", "D", "E"),
+    output_dir = "../data",
+    item_type_dist = NULL,
+    theta = NULL
+) {
+  # setting expected item type keys 
+  expected <- c("regular", "regular_clean", "diluted", "misleading")
+  
+  if (is.null(item_type_dist)) {
+    dist <- list(
+      regular_clean = 0.20,
+      diluted       = 0.10,
+      misleading    = 0.10,
+      regular       = 0.60
+    )
+  } else {
+
+    unknown <- setdiff(names(item_type_dist), expected)
+    if (length(unknown) > 0) {
+      stop(paste("item_type_dist contains unknown keys:", paste(sort(unknown), collapse = ", ")))
+    }
+    
+    # 
+    if (any(unlist(item_type_dist) < 0)) {
+      stop("item_type_dist contains negative values")
+    }
+    
+    dist <- item_type_dist
+    total_pre <- sum(unlist(dist))
+    
+    if (total_pre < 0) {
+      stop("item_type_dist must sum to a positive number")
+    }
+    
+    if (total_pre > 1) {
+      stop(paste("Item type probabilities sum to", total, "; expected <= 1.0"))
+    }
+    
+    # set regular to rest or missing probalities so that sum of all type probabilities is 1
+    if (!"regular" %in% names(dist)) {
+      dist$regular <- 1 - total_pre
+    }
+    
+    total <- sum(unlist(dist))
+    
+    if (!isTRUE(all.equal(total, 1))) {
+      dist$regular <- dist$regular + (1 - total)
+    }
+
+    # final sum validation
+    if (!isTRUE(all.equal(sum(unlist(dist)), 1.0))) {
+      stop("Item type probabilities sum to ", sum(unlist(dist)), ", expected 1.0")
+    }
+  }
+
+    if (!is.null(theta)) {
+      if(length(theta) != n_students) {
+        stop("Length of theta and intented number of students do not match. Please check.")
+      }
+    }
+
+  # after checks, return correct objects
+  structure(
+    list(
+      seed = seed,
+      n_items = n_items,
+      n_students = n_students,
+      options = options,
+      output_dir = output_dir,
+      theta = theta,
+      item_type_dist = dist[expected]
+    ),
+    class = "SimulationConfig"
+  )
+}
+
+
+```
+
+example call:
+
+```{r examplesim_conf_call}
+config <- simulation_config(n_items = 100)
+print(config$item_type_dist)
+```
+
+### Item Generator Function
+
+```{r item_generator}
+
+item_generator <- function(config) {
+  set.seed(config$seed)
+
+  # Parameter spezifications
+  item_param_specs <- list(
+    "regular_clean" = list(b_loc = -0.3, b_scale = 0.6, a_low = 0.8, a_high = 1.7),
+    "regular"       = list(b_loc = -0.7, b_scale = 1.2, a_low = 0.5, a_high = 1.6),
+    "diluted"       = list(b_loc = -1.1, b_scale = 0.8, a_low = 0.1, a_high = 0.7),
+    "misleading"    = list(b_loc = -0.2, b_scale = 0.9, a_low = 0.4, a_high = 1.7)
+  )
+
+  distractor_specs <- list(
+    "regular_clean" = list(prob = 0.0, bump = 0.0, force_dominant = FALSE),
+    "regular"       = list(prob = 0.3, bump = 0.15, force_dominant = FALSE),
+    "diluted"       = list(prob = 0.7, bump = 0.30, force_dominant = FALSE),
+    "misleading"    = list(prob = 0.95, bump = 0.60, force_dominant = TRUE)
+  )
+
+  # Internal support function: Assign item types (largest remainder method)
+  assign_item_types <- function() {
+    n <- config$n_items
+    keys <- c("regular_clean", "diluted", "misleading", "regular")
+    
+    raw <- sapply(keys, function(k) n * config$item_type_dist[[k]])
+
+    base <- floor(raw)
+    remainder <- n - sum(base)
+    
+    if (remainder > 0) {
+      diffs <- sort(raw - base, decreasing = TRUE)
+      to_add <- names(diffs)[1:remainder]
+      for (k in to_add) base[k] <- base[k] + 1
+    }
+    types <- rep(names(base), base)
+    return(sample(types)) # Shuffle
+  }
+
+  # Internal support function: distractor weights
+  generate_distractor_weights <- function(distractors, item_type) {
+    k <- length(distractors)
+    if (k == 0) return(numeric(0))
+
+    weights <- if (k == 1) {
+      1.0
+    } else if (k == 2) {
+      c(0.6, 0.4)
+    } else {
+      c(0.45, 0.30, rep(0.25 / (k - 2), k - 2))
+    }
+    weights <- weights / sum(weights)
+
+    spec <- distractor_specs[[item_type]]
+    if (runif(1) < spec$prob && k > 1) {
+      idx <- sample(1:k, 1)
+      weights[idx] <- weights[idx] + spec$bump
+      weights <- weights / sum(weights)
+      
+      if (spec$force_dominant) {
+        dom_idx <- which.max(weights)
+        weights[dom_idx] <- max(weights[dom_idx], 0.6)
+        weights <- weights / sum(weights)
+      }
+    }
+    names(weights) <- distractors
+    return(list(weights))
+  }
+
+  # Main function: generate items
+  generate_items <- function() {
+    item_types <- assign_item_types()
+    items <- list()
+    answer_key <- list()
+    
+    for (i in seq_along(item_types)) {
+      type <- item_types[i]
+      id <- paste0("item", i)
+      
+      num_opts <- sample(c(3, 4, 5), 1, prob = c(0.25, 0.45, 0.30))
+      opts <- config$options[1:num_opts]
+      correct <- sample(opts, 1)
+      distractors <- setdiff(opts, correct)
+
+      spec <- item_param_specs[[type]]
+      item <- list(
+        item = id,
+        item_type = type,
+        num_options = num_opts,
+        correct_answer = correct,
+        a_param = runif(1, spec$a_low, spec$a_high),
+        b_param = rnorm(1, spec$b_loc, spec$b_scale),
+        slip = rbeta(1, 1.5, 30),
+        distractors = list(distractors),
+        distractor_weights = generate_distractor_weights(distractors, type)
+      )
+      items[[id]] <- item
+      answer_key[[id]] <- correct
+    }
+    return(list(items = items, answer_key = answer_key))
+  }
+
+  return(list(generate_items = generate_items))
+}
+```
+
+### Response Simulator Function
+
+```{r response_simulator}
+response_simulator <- function(config) {
+  set.seed(config$seed)
+
+  # Main function
+  simulate_responses <- function(items, n_students) {
+  # Generate abilities and characteristics
+    data <- generate_student_abilities(config, n_students)
+    theta <- data$theta
+    traits <- data$traits
+    n_items <- length(items)
+    item_ids <- sapply(items, function(x) x$item)
+    answer_mat <- matrix(NA, nrow = n_students, ncol = n_items, 
+                         dimnames = list(NULL, item_ids))
+    score_mat  <- matrix(NA, nrow = n_students, ncol = n_items, 
+                         dimnames = list(NULL, item_ids))
+
+    for (i in seq_along(items)) {
+      item <- items[[i]]
+      item_id <- item$item
+      responses <- simulate_item_responses(item, theta, traits)
+      answer_mat[, item_id] <- responses$answers
+      score_mat[, item_id]  <- responses$scores
+    }
+
+    scored_responses <- as_tibble(score_mat) %>%
+      mutate(
+        score = rowSums(score_mat),
+        score_pct = round((score / n_items) * 100, 2)
+      )
+
+    testtakers <- as_tibble(traits) %>%
+      mutate(theta_true = theta) %>%
+      relocate(theta_true) %>% 
+      bind_cols(scored_responses %>% select(score, score_pct))
+
+    return(list(
+      answer_matrix = as_tibble(answer_mat),
+      scored_responses = scored_responses,
+      testtakers = testtakers
+      ))
+  }
+
+  # Internal support function
+  generate_student_abilities <- function(config, n_students) {
+    # Ability (Theta)
+    if (!is.null(config$theta)) {
+      theta <- as.numeric(config$theta)
+      if (length(theta) != n_students) stop("Provided theta array must match n_students.")
+    } else {
+      # theta default values
+      theta_main <- rbeta(n_students, 8, 2) * 6 - 4
+      theta_elite <- rnorm(n_students, 2.6, 0.4)
+      mix <- runif(n_students) < 0.03
+      theta <- ifelse(mix, theta_elite, theta_main)
+    }
+  
+    # Top performers Identification
+    top_mask <- theta > quantile(theta, 0.88)
+  
+    # Behavioral Traits
+    traits <- list(
+      carelessness = pmin(pmax(rbeta(n_students, 2, 12) * 0.10, 0.0), 0.08),
+      guessiness   = pmin(pmax(rbeta(n_students, 2, 9) * 0.40, 0.00), 0.28),
+      testwiseness = rnorm(n_students, -0.20, 0.20)
+    )
+
+    # Ability-dependent testwiseness
+    base_tw <- rnorm(n_students, 0.10, 0.20)
+    severity <- pmax(1.0 - theta, 0.0)
+    if (max(severity) > 0) {
+      severity <- 0.7 * (severity / max(severity)) + 0.3
+    }
+    traits$testwiseness <- base_tw - severity
+
+    # Adjust traits for top performers
+    traits$carelessness[top_mask] <- traits$carelessness[top_mask] * 0.85
+    #traits$guessiness[top_mask]   <- traits$guessiness[top_mask] * 0.85
+
+    return(list(theta = theta, traits = traits))
+  }
+
+  # Internal support function
+  simulate_item_responses <- function(item, theta, traits) {
+    n_students <- length(theta)
+    a <- item$a_param
+    b <- item$b_param
+    slip <- item$slip
+    correct <- item$correct_answer
+    distractors <- item$distractors[[1]]
+    weights <- item$distractor_weights[[1]]
+
+    answers <- character(n_students)
+    scores <- numeric(n_students)
+
+    p_know <- 1 / (1 + exp(-a * (theta - b)))
+    p_know <- pmin(pmax(p_know + rnorm(n_students, 0, 0.05), 0), 1)
+  
+    # Special handling misleading
+    if (item$item_type == "misleading") {
+      theta_adj <- theta + rnorm(n_students, 0, 0.4)
+      p_know <- 1 / (1 + exp(-a * (theta_adj - b)))
+    }
+
+    dominant_distractor <- if (length(weights) > 0) names(which.max(weights)) else distractors[1]
+
+    for (i in 1:n_students) {
+      knows <- runif(1) < p_know[i]
+      
+      # Carelessness
+      if (knows && runif(1) < traits$carelessness[i]) {
+        answers[i] <- choose_incorrect(correct, distractors, weights)
+        scores[i] <- 0
+        next
+      }
+
+      # Misleading Trap
+      if (item$item_type == "misleading") {
+        in_trap_band <- theta[i] < -0.5
+        if (in_trap_band && !knows) {
+          if (runif(1) < 0.85) {
+            answers[i] <- dominant_distractor
+            scores[i] <- 0
+            next
+          }
+        }
+      }
+
+      # Knows answer (incl. slip)
+      if (knows) {
+        if (runif(1) < slip) {
+          answers[i] <- choose_incorrect(correct, distractors, weights)
+          scores[i] <- 0
+        } else {
+          answers[i] <- correct
+          scores[i] <- 1
+        }
+        next
+      }
+  
+      # Does not know (Guessing / Testwiseness)
+      # Testwiseness (Middle option bias)
+      if (traits$testwiseness[i] < -0.05 && length(distractors) > 1) {
+        middle_option <- distractors[floor(length(distractors)/2) + 1]
+        if (runif(1) < 0.60) {
+          answers[i] <- middle_option
+          scores[i] <- ifelse(answers[i] == correct, 1, 0)
+          next
+        }
+      }
+
+      # Guessiness bias
+      if (runif(1) < traits$guessiness[i]) {
+        n_options <- length(distractors) + 1
+        if (runif(1) < (1/n_options)) {
+          answers[i] <- correct
+        } else {
+          answers[i] <- sample(distractors, 1)
+        }
+        scores[i] <- ifelse(answers[i] == correct, 1, 0)
+        next
+      }
+
+      # Fallback
+      all_opts <- c(correct, distractors)
+      answers[i] <- sample(all_opts, 1)
+      scores[i] <- ifelse(answers[i] == correct, 1, 0)
+    }
+
+    return(list(answers = answers, scores = scores))
+  }
+
+  # Internal support function
+  choose_incorrect <- function(correct, distractors, weights) {
+    if (length(distractors) == 0) return(correct)
+    if (length(weights) == 0) return(sample(distractors, 1))
+
+    return(sample(names(weights), 1, prob = weights))
+  }
+
+  return(list(simulate_responses = simulate_responses))
+}
+```
+
+### Main Function: Run Simulation
+
+```{r run_simulation}
+run_simulation <- function(config = NULL) {
+
+  if(is.null(config)){
+    config <- simulation_config() 
+  }
+
+  if (!dir.exists(config$output_dir)) {
+    dir.create(config$output_dir, recursive = TRUE)
+  }
+  
+  # initialize components
+  item_gen <- item_generator(config)
+  resp_sim <- response_simulator(config)
+  
+  message("Generating test items...")
+  gen_data <- item_gen$generate_items()
+  items <- gen_data$items
+  item_metadata <- bind_rows(items)
+
+  message(paste("Simulating responses for", config$n_students, "students..."))
+  sim_output <- resp_sim$simulate_responses(items, config$n_students)
+  
+  results <- list(
+    answer_matrix    = sim_output$answer_matrix,
+    item_metadata    = item_metadata,
+    scored_responses = sim_output$scored_responses,
+    testtakers       = sim_output$testtakers
+  )
+
+  message(paste("Saving results to", config$output_dir, "..."))
+
+  for (name in names(results)) {
+    df <- results[[name]]
+    base_path <- file.path(config$output_dir, name)
+    
+    write_csv(df, paste0(base_path, "_R.csv"))
+    saveRDS(df, paste0(base_path, ".rds"))
+  }
+
+  class(results) <- "SimulationResults"
+
+  return(results)
+}
+
+```
+
+## Step 0 — Configure Your Test
+
+In this block you define the structure of the exam itself:
+
+-   total number of items,
+-   proportions of each item type,
+-   and the remaining proportion will automatically become “regular” items.
+
+Feel free to adjust these values to create easier, harder, or more diagnostic tests.
+
+### Test Blueprint Parameters
+
+```{r default_values}
+n_items <- 80   # Total number of items in the exam
+
+# Proportions of special item types
+regular_clean <- 0.30   # High-quality items with clean distractors
+misleading    <- 0.10   # Items with attractive traps or cues
+diluted       <- 0.10   # Weak or unfocused items with low discrimination
+
+# The remaining proportion (1 - sum above) becomes "regular" items automatically
+```
+
+## Step 1 — Construct Your Student Ability Distribution (θ)
+
+This block lets you design and preview the ability distribution for your simulated student population.
+
+You can:
+
+-   adjust the Beta parameters for the main population,
+-   control the proportion and strength of the elite tail,
+-   inspect the resulting θ distribution visually,
+-   and decide whether to use it for the simulation.
+
+Feel free to adjust the parameters until the curve looks realistic for your scenario. When you're satisfied, the
+generated `theta_preview` will be passed into the main simulation.
+
+If you prefer the default distribution, simply run the cell without changes.
+
+These are the base parameters:
+
+***Main population (right-skewed)***
+
+-   beta_a = 7
+-   beta_b = 2
+-   scale = 4
+-   shift = -3.2
+
+***Elite tail***
+
+-   elite_mean = 2.5
+-   elite_sd = 1
+-   elite_fraction = 0.1
+
+```{r default_values2}
+#| results: 'asis'
+#| echo: false
+# --- Ability Construction & Preview ---
+
+# Choose your parameters here
+seed <- 63111426
+#seed <- 42
+n_students <- 200
+
+
+# Main population (right-skewed Beta distribution)
+beta_a <- 7      # Shape parameter α: higher values push mass toward the right (more good students)
+beta_b <- 2      # Shape parameter β: lower values keep the distribution skewed (few low-ability students)
+scale <- 4       # Stretch factor: controls the overall width of the ability range
+shift <- -3.2    # Shift factor: moves the center of the distribution left/right on the θ scale
+
+# Elite tail (small group of very strong students)
+elite_mean <- 2.5       # Average ability level of elite students (controls how "excellent" they are)
+elite_sd <- 1            # Spread of elite abilities (tight cluster vs. more variation)
+elite_fraction <- 0.1  # Proportion of students drawn from the elite tail (e.g., 3% very strong students)
+
+
+# Generate
+set.seed(seed)
+theta_main  <- rbeta(n_students, beta_a, beta_b) * scale + shift
+theta_elite <- rnorm(n_students, mean = elite_mean, sd = elite_sd)
+mix         <- runif(n_students) < elite_fraction
+
+theta_preview <- ifelse(mix, theta_elite, theta_main)
+
+pl <- ggplot(data.frame(theta = theta_preview), aes(x = theta)) +
+  geom_density(fill = "#b5c7d3", alpha = 0.5) + # Pastel-Farbe ähnlich Seaborn
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  labs(
+    title = "Preview: Ability Distribution (θ)",
+    x = "θ",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+show(pl)
+
+cat(sprintf("\n\nmin=%.2f, max=%.2f, mean=%.2f\n", 
+            min(theta_preview), max(theta_preview), mean(theta_preview)))
+
+cat(sprintf("\nStudents above 2.5: %d\n", sum(theta_preview > 2.5)))
+
+```
+
+## Step 2 — Run the Simulation
+
+If you're happy with the θ distribution above, pass `theta_preview` into the simulation via
+`simulation_config(theta=theta_preview)`.
+
+If not, go back to Step 1, adjust the parameters, and preview again.
+
+```{r config_run}
+# Config and run the simulation
+config <- simulation_config(
+    seed = seed,
+    n_items = n_items,
+    n_students = n_students,
+    output_dir = "../data/simulation_results",
+    item_type_dist = list(
+        "regular_clean" = regular_clean,
+        "misleading"    = misleading,
+        "diluted"       = diluted
+    ),
+   theta = theta_preview
+)
+
+results <- run_simulation(config)
+```
+
+
+```{r run_show}
+#| echo: false
+cat("Sample of generated data:")
+cat("Answer matrix (first 5 students, first 5 items):")
+
+print(results$answer_matrix[1:5, 1:5])
+
+cat("Item metadata (first 5 items):")
+
+print(head(results$item_metadata, 5))
+
+cat("Test-taker scores (first 5 students):")
+
+print(head(results$testtakers[, c("theta_true", "carelessness", "score")], 5))
+```
+
+```{r summary_statistics}
+#| echo: false
+
+
+print_summary_statistics <- function(results) {
+  testtakers <- results$testtakers
+  item_metadata <- results$item_metadata
+  scored_responses <- results$scored_responses
+  
+  cat("=== Test-Taker Summary ===\n")
+  cat(sprintf("Number of students: %d\n", nrow(testtakers)))
+  cat(sprintf("Mean score (%%): %.1f ± %.1f\n", 
+              mean(testtakers$score_pct), sd(testtakers$score_pct)))
+  cat(sprintf("Score range (%%): %.1f - %.1f\n", 
+              min(testtakers$score_pct), max(testtakers$score_pct)))
+  cat(sprintf("Mean ability (theta): %.3f ± %.3f\n", 
+              mean(testtakers$theta_true), sd(testtakers$theta_true)))
+  
+  cat("\n=== Item Analysis ===\n")
+  cat(sprintf("Number of items: %d\n", nrow(item_metadata)))
+  cat(sprintf("Mean difficulty (b): %.3f ± %.3f\n", 
+              mean(item_metadata$b_param), sd(item_metadata$b_param)))
+  cat(sprintf("Mean discrimination (a): %.3f ± %.3f\n", 
+              mean(item_metadata$a_param), sd(item_metadata$a_param)))
+  
+  cat("\nItem Type Distribution:\n")
+  # table() entspricht value_counts()
+  print(table(item_metadata$item_type))
+  
+  # Item-Total Korrelation berechnen
+  # Wir entfernen die Summen-Spalten (score, score_pct)
+  item_scores <- scored_responses %>% select(-score, -score_pct)
+  total_scores <- scored_responses$score
+  
+  # cor() berechnet die Korrelation zwischen Matrix-Spalten und einem Vektor
+  item_total_corrs <- cor(item_scores, total_scores)
+  
+  cat(sprintf("\nMean item-total correlation: %.3f\n", mean(item_total_corrs)))
+}
+
+# Aufruf der Funktion
+print_summary_statistics(results)
+
+```
+
+```{r plots1}
+
+# 1. Distribution of Item Types
+plot_item_type_distribution <- function(item_metadata) {
+  ggplot(item_metadata, aes(x = item_type, fill = item_type)) +
+    geom_bar() +
+    scale_fill_manual(values = item_type_colors) +
+    labs(title = "Distribution of Item Types", x = "Item Type", y = "Count") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 20, vjust = 1, hjust = 1),
+          legend.position = "none",
+          panel.grid.major.x = element_blank())
+}
+
+# 2. Answer Options and Correct Answers
+plot_answer_options <- function(item_metadata) {
+  # Falls num_options fehlt, berechnen (Länge distractors + 1)
+  if (!"num_options" %in% names(item_metadata)) {
+    item_metadata$num_options <- sapply(item_metadata$distractors, length) + 1
+  }
+
+  p1 <- ggplot(item_metadata, aes(x = factor(num_options))) +
+    geom_bar(fill = "#dad7cd") +
+    labs(title = "Number of Answer Options by Item", x = "Number of Options", y = "Count") +
+    theme_minimal()
+
+  p2 <- ggplot(item_metadata, aes(x = factor(correct_answer, levels = c("A", "B", "C", "D", "E")))) +
+    geom_bar(fill = "#ede0bf") +
+    labs(title = "Distribution of Correct Answers", x = "Correct Answer", y = "Count") +
+    theme_minimal()
+
+  p1 + p2 # Patchwork kombiniert diese zu 1x2 Subplots
+}
+
+# 3. Item Parameters Scatter (a vs b)
+plot_item_parameters_scatter <- function(item_metadata) {
+  ggplot(item_metadata, aes(x = b_param, y = a_param, color = item_type)) +
+    geom_point(size = 2, alpha = 0.8) +
+    scale_color_manual(values = item_type_colors) +
+    labs(title = "Distribution of Item Parameters (a vs b)", 
+         x = "Difficulty (b)", y = "Discrimination (a)", color = "Item Type") +
+    theme_minimal()
+}
+
+# 4. Parameter Distributions (KDE)
+plot_parameter_distributions <- function(item_metadata) {
+  p1 <- ggplot(item_metadata, aes(x = b_param, fill = item_type)) +
+    geom_density( bw = "nrd", trim = FALSE, alpha = 0.25) +
+    #geom_density(aes(y = after_stat(density * n / sum(n))), bw = "nrd", trim = FALSE, alpha = 0.25) +
+    scale_fill_manual(values = item_type_colors) +
+    labs(title = "Difficulty (b)", x = "b") +
+    theme_minimal() + theme(legend.position = "none") +
+    lims(x=c(-5, 3))
+
+  p2 <- ggplot(item_metadata, aes(x = a_param, fill = item_type)) +
+    geom_density(alpha = 0.25, bw = "nrd") +
+    scale_fill_manual(values = item_type_colors) +
+    labs(title = "Discrimination (a)", x = "a") +
+    theme_minimal() +
+    lims(x=c(-0.3, 2.5))
+
+  p1 + p2
+}
+
+# 5. Slip Distribution (Boxplot)
+plot_slip_distribution <- function(item_metadata) {
+  ggplot(item_metadata, aes(x = item_type, y = slip, fill = item_type)) +
+    geom_boxplot(linewidth = 0.5) +
+    scale_fill_manual(values = item_type_colors) +
+    labs(title = "Slip Distribution by Item Type", x = "Item Type", y = "Slip") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 20, vjust = 1, hjust = 1),
+          legend.position = "none")
+}
+
+# 6. Ability Distribution (Theta)
+plot_ability_distribution <- function(testtakers) {
+  ggplot(testtakers, aes(x = theta_true)) +
+    geom_density(fill = "#3B5070", alpha = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.6) +
+    labs(title = "Ability Distribution (θ)", x = "θ", y = "Density") +
+    theme_minimal()
+}
+
+# 7. Score Analysis (Hist + Scatter)
+plot_score_analysis <- function(testtakers) {
+  mean_val <- mean(testtakers$score_pct)
+  med_val <- median(testtakers$score_pct)
+
+  p1 <- ggplot(testtakers, aes(x = score_pct)) +
+    geom_histogram(aes(y = after_stat(density)), fill = "#4C72B0", bins = 30, alpha = 0.7) +
+    geom_density(color = "black") +
+    geom_vline(aes(xintercept = mean_val, color = "Mean"), linetype = "dashed") +
+    geom_vline(aes(xintercept = med_val, color = "Median"), linetype = "dotdash") +
+    scale_color_manual(name = "Stats", values = c(Mean = "#D62728", Median = "#2CA02C")) +
+    labs(title = "Score Distribution", x = "Total Score (%)", y = "Density") +
+    theme_minimal()
+
+  p2 <- ggplot(testtakers, aes(x = theta_true, y = score_pct)) +
+    geom_point(color = "#4C72B0", alpha = 0.5) +
+    labs(title = "Score (%) vs Ability (θ)", x = "Ability (θ)", y = "Total Score (%)") +
+    theme_minimal()
+
+  p1 + p2
+}
+
+```
+
+```{r plots_print, fig.width=12, fig.height=7}
+#| echo: false
+#| warning: false
+
+item_metadata = results$item_metadata
+testtakers = results$testtakers
+
+# Generate all visualizations
+"Generating visualizations...\n"
+
+cat("1. Item Type Distribution")
+plot_item_type_distribution(item_metadata)
+
+cat("2. Answer Options Analysis")
+plot_answer_options(item_metadata)
+
+cat("3. Item Parameters Scatter Plot")
+plot_item_parameters_scatter(item_metadata)
+
+cat("4. Parameter Distributions")
+plot_parameter_distributions(item_metadata)
+
+cat("5. Slip Parameter Distribution")
+plot_slip_distribution(item_metadata)
+
+cat("6. Ability Distribution")
+plot_ability_distribution(testtakers)
+
+cat("7. Score Analysis")
+plot_score_analysis(testtakers)
+
+cat("Visualization complete!")
+```
+
+```{r results_answer_mat}
+#| 
+results$answer_matrix
+```

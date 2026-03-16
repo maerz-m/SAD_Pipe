@@ -1,0 +1,18 @@
+# Ignore large analysis outputs
+*.nc
+
+# Ignore simulation outputs
+# data/simulation_results/*.pkl
+data/analysis_results/item_reports/*
+data/analysis_results/item_plots/*
+
+# Ignore Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore virtual environments
+venv/
+.env/

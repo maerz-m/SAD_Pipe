@@ -1,0 +1,844 @@
+---
+title: Synthetic Assessment Data Pipeline (SAD-Pipe) - Analysis
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 120
+---
+
+```{r library}
+#| include: false
+
+library(tidyverse)
+library(ggplot2)
+library(purrr)
+library(here)
+library(rstan)
+library(patchwork)
+library(knitr)
+```
+
+## Visual Encoding Reference
+
+-   This section defines all color palettes and colormaps used throughout the analysis.
+-   Centralizing the visual encodings ensures stylistic consistency and accessibility
+
+All palettes have been checked for common forms of color vision deficiency.
+
+```{r colorswatches}
+#| echo: false
+
+plot_color_swatch <- function(color_dict, title) {
+  df <- data.frame(
+    label = names(color_dict),
+    color = unlist(color_dict),
+    x = seq_along(color_dict)
+  )
+  
+  ggplot(df, aes(x = x, y = 1, fill = color)) +
+    geom_tile() +
+    scale_fill_identity() +
+    geom_text(aes(y = 0.4, label = label), vjust = 1, size = 3.5) +
+    labs(title = title) +
+    coord_fixed(ratio = 0.5, clip = "off") +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5, size = 12, margin = margin(b = 10)))
+}
+
+
+# --- Colors for answers (A-E) ---
+get_colors <- function(correct_answer = "correct") {
+  base_colors <- list(
+    'A' = '#e09f3e', 'B' = '#bf6535', 'C' = '#9E2A2B', 
+    'D' = '#791B1D', 'E' = '#540b0e', 'correct' = '#ede0bf'
+  )
+
+  if (correct_answer %in% names(base_colors)) {
+    base_colors[[correct_answer]] <- '#ede0bf'
+  }
+  return(base_colors)
+}
+
+# --- Item-Type Colors ---
+item_type_colors <- list(
+  'regular'       = '#3B5070',
+  'regular_clean' = '#765B7A',
+  'diluted'       = '#B56576',
+  'misleading'    = '#eaac8b'
+)
+
+
+colors <- get_colors()
+plot_color_swatch(colors, "Answer Choice Colors")
+plot_color_swatch(item_type_colors, "Item Type Colors")
+
+```
+
+## Load Data
+
+Load the simulated dataset (answer matrix, scored responses, item metadata, and person metadata).
+
+PKL/Rds files are used for fast loading; CSV versions are available if preferred.
+
+
+```{r datainit}
+#| include: false
+
+
+DATA_DIR_CANDIDATES <- c("data/simulation_results", "data", ".")
+
+DATA_DIR <- NULL
+for (d in DATA_DIR_CANDIDATES) {
+  potential_path <- here(d)
+  if (file.exists(file.path(potential_path, "answer_matrix.Rds"))) {
+    DATA_DIR <- potential_path
+    break
+  }
+}
+
+if (is.null(DATA_DIR)) {
+  stop(paste(
+    "Simulation output files were not found.",
+    "One of the following directories must contain answer_matrix.Rds:",
+    paste(DATA_DIR_CANDIDATES, collapse = ", "),
+    ". Run the simulation notebook first or adjust DATA_DIR_CANDIDATES."
+  ))
+}
+
+#print(paste("Loaded simulation data from:", fs::path_abs(DATA_DIR)))
+answer_matrix <- readRDS(file.path(DATA_DIR, "answer_matrix.Rds"))
+scored_responses <- readRDS(file.path(DATA_DIR, "scored_responses.Rds"))
+testtakers_post_analysis <- readRDS(file.path(DATA_DIR, "testtakers.Rds"))
+item_analysis <- readRDS(file.path(DATA_DIR, "item_metadata.Rds"))
+
+ANALYSIS_DIR <- file.path(fs::path_dir(DATA_DIR), "analysis_results")
+fs::dir_create(ANALYSIS_DIR, recurse = TRUE) 
+
+BASE_DIR <- file.path(ANALYSIS_DIR, "item_plots")
+fs::dir_create(BASE_DIR, recurse = TRUE)
+```
+
+```{r databinary}
+#| include: false
+#| 
+# prepare the data for CTT and IRT
+make_binary_matrix <- function(answer_matrix, item_analysis) {
+  # Converts the categorical answer matrix into a binary correctness matrix.
+  # Each cell is 1 if the examinee selected the correct option, 0 otherwise.
+  
+  answer_key <- setNames(item_analysis$correct_answer,
+                         item_analysis$item)
+
+  items <- names(answer_key)
+  
+  binary <- map2_dfc(answer_matrix[items], answer_key, ~ as.integer(.x == .y))
+  
+  return(binary)
+}
+
+binary <- make_binary_matrix(answer_matrix, item_analysis)
+
+```
+
+## Classical Test Theory (CTT) Diagnostics
+
+This section computes core CTT statistics to evaluate item functioning:
+
+-   item difficulty
+-   item discrimination (item–total correlation, corrected)
+-   internal consistency (Cronbach’s alpha)
+
+These diagnostics provide a first check of item quality and help verify that the simulated response patterns align with
+the intended psychometric structure.
+
+```{r cttia}
+#| echo: false
+
+#' Computes item difficulty and corrected item–total correlations.
+#'
+#' @param binary A data.frame or matrix of 0/1 correctness 
+#'   (rows = persons, columns = items).
+#'
+#' @return A data.frame with the following columns:
+#'   \itemize{
+#'     \item \code{item}: Name of the item
+#'     \item \code{difficulty}: Item difficulty (p-value)
+#'     \item \code{discrimination}: Discrimination (corrected item–total correlation)
+#'   }
+#'   
+classical_item_analysis <- function(binary) {
+  total_score <- rowSums(binary)
+  
+  results <- map_dfr(colnames(binary), function(item) {
+    p_value <- mean(binary[[item]], na.rm = TRUE)
+    total_score_excl <- total_score - binary[[item]]
+
+    corr <- cor(binary[[item]], total_score_excl, use = "complete.obs")
+    tibble(
+      item = item,
+      difficulty = round(p_value, 3),
+      discrimination = round(corr, 3)
+    )
+  })
+  
+  return(results)
+}
+
+# --- Cronbach's Alpha ---
+cronbach_alpha <- function(binary) {
+  k <- ncol(binary)
+  item_vars <- sapply(binary, var, na.rm = TRUE)
+  total_var <- var(rowSums(binary), na.rm = TRUE)
+  
+  alpha <- (k / (k - 1)) * (1 - sum(item_vars) / total_var)
+  return(round(alpha, 3))
+}
+
+```
+
+### Run CTT Analysis
+
+```{r cttarung}
+#| echo: false
+# --- Run CTT Analysis ---
+ctt_results = classical_item_analysis(binary)
+alpha_value = cronbach_alpha(binary)
+
+head(ctt_results)
+```
+
+```{r iactt}
+#| include: false
+#| 
+# --- Merge CTT results with item metadata ---
+item_analysis_ctt = left_join(item_analysis,
+    ctt_results,
+    by="item"
+)
+```
+
+```{r iacttpic}
+#| echo: false
+#| 
+cat(paste0("Cronbach's alpha: ", alpha_value, ""))
+
+cat("Difficulty summary:")
+print(summary(item_analysis_ctt$difficulty))
+cat("")
+
+cat("Discrimination (item–total correlation) summary:")
+print(summary(item_analysis_ctt$discrimination))
+cat("")
+
+# --- Difficulty vs Discrimination Plot (CTT) ---
+ggplot(item_analysis_ctt, aes(x = difficulty, 
+                              y = discrimination, 
+                              color = item_type)) +
+  geom_point(size = 2.5, alpha = 0.75) +
+  scale_color_manual(values = item_type_colors) +
+  labs(
+    title = "Item Difficulty vs Discrimination",
+    x = "Difficulty (proportion correct)",
+    y = "Discrimination (item–total correlation)",
+    color = "Item Type"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    axis.title = element_text(size = 11),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    legend.position = "right"
+  )
+
+```
+
+## Bayesian 2PL IRT model
+
+This section fits a Bayesian 2‑Parameter Logistic (2PL) IRT model to the binary response matrix. The model estimates:
+
+-   **θₚ**: latent ability for each person
+-   **aᵢ**: item discrimination (slope of the ICC)
+-   **bᵢ**: item difficulty (location on the ability scale)
+
+### Priors
+
+-   **aᵢ \~ LogNormal(0, 0.5)** ensures strictly positive discrimination
+-   **bᵢ \~ Normal(0, 2)** provides a weakly informative location prior
+-   **θₚ \~ Normal(0, 1)** follows the standard IRT identification convention
+
+### Likelihood
+
+For each person *p* and item *i*:
+
+$p_{pi} = \text{logistic}\!\left(a_i(\theta_p - b_i)\right)$
+
+$u_{pi} \sim \text{Bernoulli}(p_{pi})$
+
+This model allows us to recover the generating item parameters and compare them to the empirical CTT statistics.
+
+```{r stan}
+#| warning: false
+#| message: false 
+#| error: false 
+#| results: false
+
+stan_data <- list(
+  N = nrow(binary),
+  I = ncol(binary),
+  y = as.matrix(binary)
+)
+
+stan_model_code <- "
+  data {
+    int<lower=1> N;                // Amount Students
+    int<lower=1> I;                // Amount Items
+    int<lower=0, upper=1> y[N, I]; // Answermatrix
+  }
+  parameters {
+    vector[N] theta;               
+    vector<lower=0>[I] a;          // Discrimination (LogNormal via lower=0)
+    vector[I] b;                   // Difficulty
+  }
+  model {
+    theta ~ normal(0, 1);          
+    a ~ lognormal(0, 0.5);
+    b ~ normal(0, 2);
+    
+    for (n in 1:N) {
+      y[n] ~ bernoulli_logit(a .* (theta[n] - b));
+    }
+  }
+  "
+
+
+fit <- stan(
+  model_code = stan_model_code,
+  data = stan_data,
+  chains = 4,
+  iter = 2000,   # 1000 warm-up + 1000 draws
+  warmup = 1000,
+  cores = 4,
+  seed = 42,
+  control = list(adapt_delta = 0.9) 
+)
+
+a_hat <- summary(fit, pars = "a")$summary[, "mean"]
+b_hat <- summary(fit, pars = "b")$summary[, "mean"]
+
+irt_results <- tibble(
+  item = colnames(binary),
+  a_hat = a_hat,
+  b_hat = b_hat
+)
+
+```
+
+```{r irtcttia}
+# --- Merge IRT results with item metadata ---
+item_analysis_ctt_irt = left_join(item_analysis_ctt, 
+                              irt_results,
+                              by="item")
+```
+
+```{r irtsum}
+#| echo: false
+
+
+cat("Difficulty (b) summary:")
+print(summary(item_analysis_ctt_irt$b_hat))
+cat("Discrimination (a) summary:")
+print(summary(item_analysis_ctt_irt$a_hat))
+
+base_theme <- theme_minimal() + 
+  theme(panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black"),
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# --- Panel 1: b_hat vs a_hat ---
+p1 <- ggplot(item_analysis_ctt_irt, aes(x = b_hat, y = a_hat, color = item_type)) +
+  geom_point(size = 3, alpha = 0.75) +
+  scale_color_manual(values = item_type_colors) +
+  labs(title = "Estimated Difficulty vs Discrimination", x = "b_hat_irt", y = "a_hat_irt") +
+  base_theme
+
+# --- Panel 2: a_hat vs a_param (Recovery) ---
+p2 <- ggplot(item_analysis_ctt_irt, aes(x = a_param, y = a_hat, color = item_type)) +
+  geom_point(size = 3, alpha = 0.75) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", alpha = 0.4) + # k-- Linie
+  scale_color_manual(values = item_type_colors) +
+  labs(title = "Discrimination Recovery", x = "a_param (true)", y = "a_hat (estimated)") +
+  base_theme
+
+# --- Panel 3: b_hat vs b_param (Recovery) ---
+p3 <- ggplot(item_analysis_ctt_irt, aes(x = b_param, y = b_hat, color = item_type)) +
+  geom_point(size = 3, alpha = 0.75) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", alpha = 0.4) +
+  scale_color_manual(values = item_type_colors) +
+  labs(title = "Difficulty Recovery", x = "b_param (true)", y = "b_hat (estimated)") +
+  base_theme
+
+(p1 | p2 | p3) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom")
+
+```
+
+### Comparing Generating and Estimated IRT Parameters
+
+The dataset used in this notebook was created by simulating item responses from a known set of IRT parameters (a_param,
+b_param). These values represent the *generating* item characteristics: the discrimination and difficulty that define
+the “true” response process in the simulated population.
+
+In the next step, we fit a Bayesian 2PL IRT model to the simulated data. This model estimates its own set of item
+parameters (a_hat, b_hat) based solely on the observed responses. Because the estimation model uses different priors,
+identification constraints, and numerical properties than the simulation procedure, the recovered parameters will not
+match the generating values exactly.
+
+This comparison is therefore not a test of whether the model reproduces the exact numeric values, but whether it
+recovers the *structure* of the items: their relative ordering, their separation by item type, and the overall shape of
+the parameter space. Good recovery means that items with higher true difficulty also have higher estimated difficulty,
+and similarly for discrimination, even if the absolute values differ.
+
+The following plot visualizes this relationship by showing the generating parameters (circles) and the estimated
+parameters (crosses), with arrows indicating the shift from true to estimated values.
+
+### Why true and estimated parameters differ
+
+The estimated IRT parameters do not match the generating parameters exactly, and this is expected for several reasons:
+
+1.  **Person parameters introduce stochastic variation.**\
+    Item estimates depend on the distribution of θ, so even with perfect model fit the recovered parameters will deviate
+    from the generating values.
+
+2.  **The simulation model and the estimation model are not identical.**\
+    The data were generated using our own simulation logic, whereas the estimation uses a Bayesian 2PL model with
+    different priors and identification constraints. Differences between true and estimated values therefore reflect
+    model structure rather than error.
+
+3.  **Bayesian priors induce shrinkage.**\
+    Extreme discrimination or difficulty values are regularized toward the center of the prior distribution, which
+    improves stability but reduces exact recovery.
+
+4.  **IRT parameters are identifiable only up to a linear transformation.**\
+    The absolute scale of (a, b, θ) is arbitrary; only their relative structure matters. Good recovery therefore means
+    preserving the ordering and relationships, not reproducing exact numeric values.
+
+Overall, the model performs well when the estimated parameters preserve the relative ordering and item-type structure of
+the generating parameters, even if the absolute values differ.
+
+## CTT–IRT (recovered) Comparison
+
+This section compares empirical CTT statistics with the estimated IRT parameters. Whereas CTT difficulty and
+discrimination are sample‑dependent descriptive indices, IRT parameters (a, b) represent model‑based latent item
+characteristics.
+
+Comparing both perspectives allows us to evaluate:
+
+-   how well empirical difficulty (proportion correct) aligns with IRT difficulty (b)
+-   how well empirical discrimination (item–total correlation) aligns with IRT discrimination (a)
+
+Together, these diagnostics provide a comprehensive view of item functioning across both classical and modern test
+theory.
+
+```{r plots1}
+
+comparison_theme <- theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 11),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    legend.position = "bottom"
+  )
+
+# 1. CTT Difficulty vs IRT Difficulty (b)
+p_diff <- ggplot(item_analysis_ctt_irt, aes(x = difficulty, y = b_hat, color = item_type)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_color_manual(values = item_type_colors) +
+  labs(
+    title = "CTT Difficulty vs IRT Difficulty (b)",
+    x = "CTT Difficulty (proportion correct)",
+    y = "IRT Difficulty (b)"
+  ) +
+  comparison_theme
+
+# 2. CTT Discrimination vs IRT Discrimination (a)
+p_disc <- ggplot(item_analysis_ctt_irt, aes(x = discrimination, y = a_hat, color = item_type)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_color_manual(values = item_type_colors) +
+  labs(
+    title = "CTT Discrimination vs IRT Discrimination (a)",
+    x = "CTT Discrimination (item–total correlation)",
+    y = "IRT Discrimination (a)"
+  ) +
+  comparison_theme
+
+(p_diff | p_disc) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom")
+
+```
+
+## Person‑Level Diagnostics
+
+This section documents and checks person-level (testtaker-level) structure.
+
+We analyze relationships between:
+
+-   `theta_true`: generating latent ability (ground truth from the simulation)
+-   `theta_post`: posterior mean ability estimate from the Bayesian 2PL model
+-   behavioral traits: `carelessness`, `guessiness`, `testwiseness`
+-   observed performance: `score`, `score_pct`
+
+These diagnostics serve two purposes:
+
+1.  **Sanity check**: the simulated traits should show interpretable associations with performance.
+2.  **Model recovery**: `theta_post` should be strongly associated with `theta_true` (up to estimation error).
+
+Note: correlations involving `score` / `score_pct` are expected to be strong because these are derived from the same
+response data used to estimate `theta_post`.
+
+```{r plots2prep}
+theta_post_means <- summary(fit, pars = "theta")$summary[, "mean"]
+# recovered ability
+testtakers_post_analysis <- testtakers_post_analysis %>%
+  mutate(theta_post = theta_post_means)
+```
+
+```{r plots2}
+# Person-level plots + correlations
+
+# Ensure theta_post is present (computed earlier)
+if (!"theta_post" %in% colnames(testtakers_post_analysis)) {
+  stop("Column `theta_post` missing. Run the Bayesian 2PL IRT model cells first.")
+}
+
+cols <- c("theta_true", "theta_post", "carelessness", "guessiness", "testwiseness", "score", "score_pct")
+
+cor_matrix <- testtakers_post_analysis %>%
+  select(all_of(cols)) %>%
+  cor(use = "complete.obs") %>%
+  round(3)
+
+cat("Correlations:")
+kable(cor_matrix)
+
+# --- Theta recovery: theta_true vs theta_post ---
+p_recovery <- ggplot(testtakers_post_analysis, aes(x = theta_true, y = theta_post)) +
+  geom_point(color = "#4C72B0", alpha = 0.6, size = 1.5) +
+  labs(title = "Ability Recovery: θ_true vs θ_post",
+       x = "θ_true (generating)", y = "θ_post (estimated)") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(), axis.line = element_line(color = "black"))
+
+print(p_recovery)
+
+# --- Traits vs Ability ---
+trait_scatter <- function(y_var, title, color) {
+  ggplot(testtakers_post_analysis, aes(x = theta_true, y = .data[[y_var]])) +
+    geom_point(color = color, alpha = 0.6, size = 1.2) +
+    labs(title = title, x = "θ_true", y = y_var) +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank(), axis.line = element_line(color = "black"))
+}
+
+p1 <- trait_scatter("carelessness", "Carelessness vs θ_true", "#765B7A")
+p2 <- trait_scatter("guessiness", "Guessiness vs θ_true", "#B56576")
+p3 <- trait_scatter("testwiseness", "Testwiseness vs θ_true", "#eaac8b")
+
+(p1 | p2 | p3)
+
+# --- 4. Performance vs Ability ---
+perf_scatter <- function(x_var, title) {
+  ggplot(testtakers_post_analysis, aes(x = .data[[x_var]], y = score_pct)) +
+    geom_point(color = "#4C72B0", alpha = 0.6, size = 1.5) +
+    labs(title = title, x = x_var, y = "Score (%)") +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank(), axis.line = element_line(color = "black"))
+}
+
+p4 <- perf_scatter("theta_true", "Score (%) vs θ_true")
+p5 <- perf_scatter("theta_post", "Score (%) vs θ_post")
+
+(p4 | p5)
+
+```
+
+## Save the dataframes
+
+```{r savedata}
+csv_path <- file.path(ANALYSIS_DIR, "testtakers_post_analysis_r.csv")
+rds_path <- file.path(ANALYSIS_DIR, "testtakers_post_analysis.Rds")
+
+
+write_csv(testtakers_post_analysis, csv_path)
+
+saveRDS(testtakers_post_analysis, rds_path)
+
+message(paste("Daten erfolgreich gespeichert in:", ANALYSIS_DIR))
+
+```
+
+```{r writedata}
+write_csv(item_analysis_ctt_irt, file.path(ANALYSIS_DIR, "item_analysis_r.csv"))
+
+saveRDS(item_analysis_ctt_irt, file.path(ANALYSIS_DIR, "item_analysis.Rds"))
+
+```
+
+# **Item‑Level Diagnostics**
+
+To understand how each item behaves across different levels of performance and ability, we generate a **six‑panel
+diagnostic grid**. This visualization integrates classical test theory (CTT) and item response theory (IRT), showing how
+response patterns relate to both observed scores and model‑based ability estimates.
+
+The six panels provide complementary perspectives:
+
+------------------------------------------------------------------------------------------------------------------------
+
+**1. IRT Item Map (a–b space)**\
+Positions the item relative to all others in terms of:
+
+-   **difficulty** (b‑parameter)
+-   **discrimination** (a‑parameter)
+-   **item type**
+
+This situates the item within the broader structure of the test and highlights whether it behaves similarly to other
+items of the same type.
+
+------------------------------------------------------------------------------------------------------------------------
+
+**2. CTT Item Map (difficulty vs. discrimination)**\
+Displays the item’s classical difficulty (p‑value) and discrimination (corrected item–total correlation) in the same
+way.\
+This provides a familiar, score‑based view of item functioning and allows quick comparison with the rest of the test.
+
+------------------------------------------------------------------------------------------------------------------------
+
+**3. IRT Item Characteristic Curve (ICC)**\
+Shows the model‑based probability of a correct response as a function of latent ability $\theta$.\
+A tangent line at $\theta = b$ visualizes the item’s discrimination (slope), and the b‑parameter is marked explicitly.\
+This panel isolates the item’s psychometric behavior from total‑score circularity.
+
+------------------------------------------------------------------------------------------------------------------------
+
+**4. Answer Distribution by Score Group**\
+Displays how often each answer option is selected within score‑percentage groups.\
+Because these groups are derived from the total score, this panel reflects a **circular relationship**:\
+items that contribute strongly to the score naturally show clearer separation between groups.
+
+Useful for:
+
+-   distractor analysis
+-   identifying non‑functioning or overly attractive distractors
+-   spotting score‑group inconsistencies
+
+------------------------------------------------------------------------------------------------------------------------
+
+**5. Item Summary Block**\
+A compact textual summary of key item statistics:
+
+-   CTT difficulty
+-   CTT discrimination
+-   IRT a‑parameter
+-   IRT b‑parameter
+-   item type
+
+This provides a quick reference for reviewers.
+
+------------------------------------------------------------------------------------------------------------------------
+
+**6. CTT Discrimination Plot**\
+Shows the relationship between:
+
+-   **item score** (0/1)
+-   **total score excluding the item**
+
+The red dashed line connects the **group means** for incorrect vs. correct responders, and the corrected item–total
+correlation is displayed.\
+This panel visualizes how strongly the item separates low‑ and high‑scoring examinees.
+
+------------------------------------------------------------------------------------------------------------------------
+
+**Integrated Interpretation**
+
+Together, these six panels provide a comprehensive view of item behaviour:
+
+-   how distractors function across performance levels
+-   how well the ICC fits empirical response patterns
+-   how strongly the item discriminates between ability groups
+-   whether score‑based and ability‑based patterns diverge
+-   how the item compares to the rest of the test in both CTT and IRT space
+
+This integrated view helps identify items that are misfitting, poorly discriminating, too easy or too hard, or
+inconsistent across scoring and ability metrics.
+
+```{r plots3prep}
+irt_prob <- function(theta, a, b) {
+  return(1 / (1 + exp(-a * (theta - b))))
+}
+
+plot_item_descriptive_grid <- function(item_analysis, plot_df, binary, item_col) {
+  
+  meta <- item_analysis %>% filter(item == item_col) %>% slice(1)
+  correct_ans_val <- meta$correct_answer
+  a <- as.numeric(meta$a_hat)
+  b <- as.numeric(meta$b_hat)
+  
+
+  current_item_colors <- unlist(get_colors(correct_ans_val))
+  type_colors <- unlist(item_type_colors)
+
+  # --- PANEL 1: IRT MAP ---
+  p1 <- ggplot(item_analysis, aes(x = a_hat, y = b_hat, color = item_type)) +
+    geom_point(alpha = 0.6, size = 2) +
+    geom_point(data = meta, size = 5, shape = 21, fill = "transparent", color = "black", stroke = 1.2) +
+    scale_color_manual(values = type_colors) +
+    labs(title = "IRT item map") + theme_minimal() + theme(legend.position = "none")
+
+  # --- PANEL 2: CTT MAP ---
+  p2 <- ggplot(item_analysis, aes(x = discrimination, y = difficulty, color = item_type)) +
+    geom_point(alpha = 0.6, size = 2) +
+    geom_point(data = meta, size = 5, shape = 21, fill = "transparent", color = "black", stroke = 1.2) +
+    scale_color_manual(values = type_colors) +
+    labs(title = "CTT item map", color = "Item Type") + theme_minimal()
+
+  # --- PANEL 3: ICC CURVE ---
+  theta_range <- seq(-6, 6, length.out = 300)
+  icc_data <- data.frame(theta = theta_range, prob = 1 / (1 + exp(-a * (theta_range - b))))
+  slope <- a / 4
+  
+  p3 <- ggplot(icc_data, aes(x = theta, y = prob)) +
+    geom_line(linewidth = 1) +
+    geom_vline(xintercept = b, linetype = "dashed", color = "grey") +
+    annotate(geom = "text", x = b + 0.2, label = paste0("b=", str_sub(as.character(b), 1, 4)), y = 0.15,
+             color = "grey", angle = 90, size = 3.5) +
+    geom_abline(intercept = 0.5 - slope * b, slope = slope, color = "#297045", linetype = "dotted", linewidth = 1) +
+    annotate(geom = "text", x = 5, label = paste0("Tangent (slope=", str_sub(as.character(slope), 1, 4),")"),
+             y = 0.05, color = "#297045", size = 2.5) +
+    labs(title = paste("IRT curve:", item_col), x = expression(Ability ~ theta), y = "P(correct)") +
+    theme_minimal()+
+    lims(y = c(0, 1))
+
+  # --- PANEL 4: ANSWER DISTRIBUTION ---
+  all_levels <- c(correct_ans_val, meta$distractors[[1]])
+  all_labels <- all_levels
+  all_labels[1] <- str_c(all_labels[1], "*")
+  distr_df <- plot_df %>%
+    mutate(score_grp = cut(score/100, breaks = c(-0.01, 0.6, 0.7, 0.8, 0.9, 1.01), 
+                           labels = c("0–59%", "60–69%", "70–79%", "80–89%", "90–100%"))) %>%
+    group_by(score_grp, ans = !!sym(item_col)) %>%
+    summarise(n = n(), .groups = "drop_last") %>%
+    mutate(prop = n / sum(n),
+           ans = factor(ans, levels = rev(all_levels)))
+
+  count_dist <- distr_df %>%
+    group_by(score_grp) %>%
+    summarise(n_total = sum(n))
+  
+
+
+  p4 <- ggplot(distr_df, aes(x = score_grp, y = prop, fill = ans)) +
+    geom_bar(stat = "identity", position = "stack", color = "white", linewidth = 0.2) +
+    geom_text(data = count_dist, 
+              aes(x = score_grp, y = 1.02, label = paste0("n=", n_total)), 
+              inherit.aes = FALSE,
+              size = 3,
+              vjust = 0) +
+    scale_fill_manual(breaks = all_levels, labels = all_labels, values = current_item_colors, drop = FALSE) +
+    scale_y_continuous(limits = c(0, 1.12), labels = scales::percent_format()) +
+    labs(title = paste0("Answers (Correct: ", correct_ans_val, ")"),
+         x = "Score Group",
+         y = "Proportion",
+         fill = "Choice") +
+    theme_minimal() 
+
+  # --- PANEL 5: SUMMARY TEXT ---
+  summary_text <- paste0(
+    "Item: ", item_col, "",
+    "Type: ", meta$item_type, "",
+    "IRT a: ", round(a, 3), "",
+    "IRT b: ", round(b, 3), "",
+    "Diff (p): ", round(meta$difficulty, 3), "",
+    "Discr:  ", round(meta$discrimination, 3)
+  )
+  p5 <- ggplot() + 
+    annotate("text", x = -0.75, y = 2, label = summary_text, family = "mono", hjust = 0.5, vjust = 0.5, size = 3.5) + 
+    theme_void()
+
+  # --- PANEL 6: CTT DISCRIMINATION ---
+  total_excl <- rowSums(binary[, colnames(binary) != item_col], na.rm = TRUE)
+  ctt_df <- data.frame(x = factor(binary[[item_col]], labels = c("Incorrect", "Correct")), y = total_excl)
+  
+  p6 <- ggplot(ctt_df, aes(x = x, y = y)) +
+    geom_jitter(alpha = 0.2, width = 0.15, color = "gray40") +
+    stat_summary(fun = mean, geom = "point", size = 4, color = "#297045") +
+    stat_summary(fun = mean, geom = "line", aes(group = 1), linetype = "dashed", color = "#297045", linewidth = 1) +
+    labs(title = "CTT Discrimination", x = "Item Score", y = "Total (excl. item)") +
+    theme_minimal()+
+    lims(y = c(0, ncol(plot_df)))
+
+  # --- ASSEMBLY ---
+  (p1 | p2) / (p3 | p4) / (p5 | p6) + 
+    plot_layout(heights = c(1, 1, 0.7)) & 
+    theme(plot.title = element_text(size = 10, face = "bold"))
+}
+
+```
+
+```{r plots3}
+plot_df <- answer_matrix
+plot_df['score'] <-  testtakers_post_analysis['score_pct']
+plot_df
+
+plot_item_descriptive_grid(item_analysis_ctt_irt, plot_df, binary, 'item1')
+```
+
+### Exporting Item-Level Diagnostic Plots
+
+For transparency and reproducibility, we generate a full diagnostic plot for each item and store the resulting figures
+in a dedicated folder. This creates a complete item-level documentation set, allowing reviewers and collaborators to
+inspect distractor functioning, score-based and ability-based performance patterns, and the alignment between empirical
+data and the estimated IRT model.
+
+```{r plots4}
+
+save_item_figure <- function(plot_obj, base_dir, item, item_type, suffix = "") {
+  type_dir <- file.path(base_dir, item_type)
+  fs::dir_create(type_dir, recurse = TRUE)
+  
+  filename <- paste0(item, suffix, ".png")
+  filepath <- file.path(type_dir, filename)
+  
+  ggsave(
+    filename = filepath,
+    plot = plot_obj,
+    dpi = 150,
+    width = 14,
+    height = 12,
+    units = "in",
+    device = "png"
+  )
+}
+
+```
+
+```{r plotswalk}
+purrr::walk(item_analysis_ctt_irt$item, function(curr_item) {
+  curr_type <- item_analysis_ctt_irt %>% 
+    filter(item == curr_item) %>% 
+    pull(item_type)
+
+  fig_panel <- plot_item_descriptive_grid(item_analysis_ctt_irt, plot_df, binary, curr_item)
+  
+  save_item_figure(fig_panel, BASE_DIR, curr_item, curr_type, suffix = "_panel_r")
+})
+
+cat("All item plots generated and saved.")
+```
+
+```{r}
+item_analysis_ctt_irt
+
+```
